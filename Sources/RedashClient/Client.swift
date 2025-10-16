@@ -182,24 +182,42 @@ public final class Client {
         baseParams: [String: String] = [:],
         maxAge: Int = 0,
         limit: Int = 10000,
-        maxIter: Int = 100
+        maxIter: Int = 100,
+        showProgress: Bool = true
     ) throws -> DataFrame {
         var headers: [String] = []
         var allRows: [[String]] = []
+        var totalRows = 0
+        
         if limit <= 0 {
             return try self.query(queryId: queryId, params: baseParams, maxAge: maxAge)
         }
+        
+        let progress = showProgress ? ProgressReporter(totalSteps: maxIter) : nil
+        
         for batchIndex in 0..<maxIter {
             let startIndex = batchIndex * limit
             var params = baseParams
             params["offset_rows"] = String(startIndex)
             params["limit_rows"] = String(limit)
+            
+            if showProgress {
+                progress?.update(step: batchIndex + 1, message: "第\(batchIndex + 1)ページ取得中 (\(totalRows)行取得済み)")
+            }
+            
             let df = try self.query(queryId: queryId, params: params, maxAge: maxAge)
             if df.rows.isEmpty { break }
             if headers.isEmpty { headers = df.headers }
             allRows.append(contentsOf: df.rows)
+            totalRows += df.rows.count
+            
             if df.rows.count < limit { break }
         }
+        
+        if showProgress {
+            progress?.complete(message: "Safeクエリ完了、\(totalRows)行のデータを取得")
+        }
+        
         return DataFrame(headers: headers, rows: allRows)
     }
 
@@ -211,7 +229,8 @@ public final class Client {
         interval: String,
         intervalMultiple: Int = 1,
         baseParams: [String: String] = [:],
-        maxAge: Int = 0
+        maxAge: Int = 0,
+        showProgress: Bool = true
     ) throws -> DataFrame {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
@@ -237,23 +256,125 @@ public final class Client {
                 return nil
             }
         }
+        
+        // 计算总的时间段数量
+        var tempCurrent = start
+        var totalPeriods = 0
+        while tempCurrent <= end {
+            guard let next = add(tempCurrent) else { break }
+            totalPeriods += 1
+            if next <= tempCurrent { break }
+            tempCurrent = next
+        }
+        
+        // 确保totalPeriods至少为1，避免除零错误
+        let safeTotalPeriods = max(totalPeriods, 1)
+        let progress = showProgress ? ProgressReporter(totalSteps: safeTotalPeriods) : nil
         var current = start
         var headers: [String] = []
         var allRows: [[String]] = []
+        var totalRows = 0
+        var periodIndex = 0
+        
         while current <= end {
             guard let next = add(current) else { break }
             let nextMinusOne = cal.date(byAdding: .day, value: -1, to: next) ?? next
             let segmentEnd = min(nextMinusOne, end)
+            
+            if showProgress {
+                let startStr = formatter.string(from: current)
+                let endStr = formatter.string(from: segmentEnd)
+                progress?.update(step: periodIndex + 1, 
+                               message: "期間処理中: \(startStr) から \(endStr) (\(totalRows)行取得済み)")
+            }
+            
             var params = baseParams
             params["start_date"] = formatter.string(from: current)
             params["end_date"] = formatter.string(from: segmentEnd)
+            
             let df = try self.query(queryId: queryId, params: params, maxAge: maxAge)
             if headers.isEmpty { headers = df.headers }
-            if !df.rows.isEmpty { allRows.append(contentsOf: df.rows) }
+            if !df.rows.isEmpty { 
+                allRows.append(contentsOf: df.rows)
+                totalRows += df.rows.count
+            }
+            
+            // 防止无限循环：如果next <= current，说明没有进展
             if next <= current { break }
             current = next
+            periodIndex += 1
+            
+            // 额外的安全检查：防止无限循环
+            if periodIndex > 10000 { break }
         }
+        
+        if showProgress {
+            progress?.complete(message: "Periodクエリ完了、\(totalRows)行のデータを取得")
+        }
+        
         return DataFrame(headers: headers, rows: allRows)
+    }
+}
+
+public class ProgressReporter {
+    private let totalSteps: Int
+    private var currentStep: Int = 0
+    private var startTime: Date
+    private var lastUpdateTime: Date
+    
+    public init(totalSteps: Int) {
+        self.totalSteps = totalSteps
+        self.startTime = Date()
+        self.lastUpdateTime = Date()
+    }
+    
+    public func update(step: Int, message: String = "") {
+        currentStep = step
+        let now = Date()
+        let elapsed = now.timeIntervalSince(startTime)
+        
+        // 防止除零错误
+        let safeTotalSteps = max(totalSteps, 1)
+        let progress = Double(step) / Double(safeTotalSteps)
+        
+        // 计算ETA
+        let eta: String
+        if step > 0 && totalSteps > 0 {
+            let avgTimePerStep = elapsed / Double(step)
+            let remainingSteps = totalSteps - step
+            let etaSeconds = avgTimePerStep * Double(remainingSteps)
+            eta = formatDuration(etaSeconds)
+        } else {
+            eta = "計算中..."
+        }
+        
+        // 显示进度条
+        let barLength = 30
+        let filledLength = Int(progress * Double(barLength))
+        let bar = String(repeating: "█", count: filledLength) + 
+                  String(repeating: "░", count: barLength - filledLength)
+        
+        let progressText = String(format: "\r[%@] %d/%d (%.1f%%) ETA: %@ %@", 
+                                 bar, step, totalSteps, progress * 100, eta, message)
+        
+        FileHandle.standardError.write(Data(progressText.utf8))
+        lastUpdateTime = now
+    }
+    
+    public func complete(message: String = "完了") {
+        let elapsed = Date().timeIntervalSince(startTime)
+        let duration = formatDuration(elapsed)
+        FileHandle.standardError.write(Data("\n✅ \(message) - 所要時間: \(duration)\n".utf8))
+    }
+    
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        if seconds < 60 {
+            return String(format: "%.0fs", seconds)
+        } else if seconds < 3600 {
+            return String(format: "%.1fm", seconds / 60)
+        } else {
+            return String(format: "%.1fh", seconds / 3600)
+        }
     }
 }
 

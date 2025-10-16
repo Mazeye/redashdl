@@ -23,10 +23,6 @@ let package = Package(
         .target(
             name: "RedashClient",
             dependencies: []
-        ),
-        .testTarget(
-            name: "RedashClientTests",
-            dependencies: ["RedashClient"]
         )
     ]
 )
