@@ -105,11 +105,18 @@ struct Safe: ParsableCommand {
     @Option(name: [.customShort("l"), .long], help: "Limit per page") var limit: Int = 10000
     @Option(name: [.customShort("n"), .long], help: "Max iterations") var maxiter: Int = 100
     @Option(name: [.customShort("p"), .long], parsing: .unconditional, help: "Params JSON string") var params: String?
+    @Option(name: [.long], help: "Number of concurrent requests (default: 1, max: 5)") var concurrency: Int = 1
     @Flag(name: [.long], help: "禁用进度显示")
     var noProgress: Bool = false
     @OptionGroup var common: CommonOptions
 
     func run() throws {
+        // 验证并发数
+        let safeConcurrency = max(1, min(concurrency, 5))
+        if concurrency != safeConcurrency {
+            FileHandle.standardError.write(Data("Warning: Concurrency adjusted from \(concurrency) to \(safeConcurrency) (max: 5)\n".utf8))
+        }
+        
         let creds = try common.loadCredentials()
         let client = RedashClient.Client(endpoint: creds.endpoint, apiKey: creds.apikey)
         let baseParams: [String:String] = {
@@ -121,7 +128,7 @@ struct Safe: ParsableCommand {
             }
             return [:]
         }()
-        let df = try client.safeQuery(queryId: id, baseParams: baseParams, maxAge: 0, limit: limit, maxIter: maxiter, showProgress: !noProgress)
+        let df = try client.safeQuery(queryId: id, baseParams: baseParams, maxAge: 0, limit: limit, maxIter: maxiter, showProgress: !noProgress, concurrency: safeConcurrency)
         let outPath = common.output ?? "redash_\(id)_safe.csv"
         try CSVWriter.write(rows: df.rows, headers: df.headers, to: URL(fileURLWithPath: outPath))
         FileHandle.standardError.write(Data("Wrote \(df.rows.count) rows to \(outPath)\n".utf8))
@@ -138,11 +145,18 @@ struct Period: ParsableCommand {
     @Option(name: [.customShort("t"), .long], help: "Interval: d/w/m/q/y") var interval: String
     @Option(name: [.customShort("m"), .long], help: "Interval multiple") var mult: Int = 1
     @Option(name: [.customShort("p"), .long], parsing: .unconditional, help: "Params JSON string") var params: String?
+    @Option(name: [.long], help: "Number of concurrent requests (default: 1, max: 5)") var concurrency: Int = 1
     @Flag(name: [.long], help: "禁用进度显示")
     var noProgress: Bool = false
     @OptionGroup var common: CommonOptions
 
     func run() throws {
+        // 验证并发数
+        let safeConcurrency = max(1, min(concurrency, 5))
+        if concurrency != safeConcurrency {
+            FileHandle.standardError.write(Data("Warning: Concurrency adjusted from \(concurrency) to \(safeConcurrency) (max: 5)\n".utf8))
+        }
+        
         let creds = try common.loadCredentials()
         let client = RedashClient.Client(endpoint: creds.endpoint, apiKey: creds.apikey)
         let baseParams: [String:String] = {
@@ -154,7 +168,7 @@ struct Period: ParsableCommand {
             }
             return [:]
         }()
-        let df = try client.periodLimitedQuery(queryId: id, startDate: start, endDate: end, interval: interval, intervalMultiple: mult, baseParams: baseParams, maxAge: 0, showProgress: !noProgress)
+        let df = try client.periodLimitedQuery(queryId: id, startDate: start, endDate: end, interval: interval, intervalMultiple: mult, baseParams: baseParams, maxAge: 0, showProgress: !noProgress, concurrency: safeConcurrency)
         let outPath = common.output ?? "redash_\(id)_period.csv"
         try CSVWriter.write(rows: df.rows, headers: df.headers, to: URL(fileURLWithPath: outPath))
         FileHandle.standardError.write(Data("Wrote \(df.rows.count) rows to \(outPath)\n".utf8))

@@ -74,6 +74,8 @@ redash-dl query -i 42 -o result.csv
 redash-dl safe -i 2674 -l 100000 -n 50 -c creds.json
 # パラメータ付き
 redash-dl safe -i 2674 -l 100000 -p '{"foo":"bar"}'
+# 並行処理で高速化（3並行）
+redash-dl safe -i 2674 -l 100000 --concurrency 3
 # 進捗表示を無効化
 redash-dl safe -i 2674 -l 100000 --no-progress
 ```
@@ -87,11 +89,36 @@ redash-dl safe -i 2674 -l 100000 --no-progress
 redash-dl period -i 6738 -s 2023-01-01 -e 2024-06-20 -t m -m 3 -c creds.json
 # 週単位
 redash-dl period -i 6738 -s 2023-01-01 -e 2024-06-20 -t w
+# 並行処理で高速化（2並行）
+redash-dl period -i 6738 -s 2023-01-01 -e 2024-06-20 -t m --concurrency 2
 # 進捗表示を無効化
 redash-dl period -i 6738 -s 2023-01-01 -e 2024-06-20 -t m --no-progress
 ```
 
 `-t/--interval` の指定可能値：d/day, w/week, m/month, q/quarter, y/year
+
+## 並行処理機能
+
+`safe`と`period`モードで並行処理をサポート：
+
+- **並行数制御** - `--concurrency`オプションで並行数を指定（デフォルト: 1, 最大: 5）
+- **自動調整** - 指定した並行数が5を超える場合は自動的に5に調整
+- **安全制限** - サーバーへの負荷を考慮した最大並行数制限
+- **後方互換** - 並行数を指定しない場合は従来の順次実行
+
+### 並行処理の例
+
+```bash
+# 3並行でSafeクエリ実行
+redash-dl safe -i 1234 -l 10000 --concurrency 3
+
+# 2並行でPeriodクエリ実行
+redash-dl period -i 1234 -s 2025-01-01 -e 2025-12-31 -t m --concurrency 2
+
+# 並行数制限の例（10を指定しても5に調整される）
+redash-dl safe -i 1234 --concurrency 10
+# Warning: Concurrency adjusted from 10 to 5 (max: 5)
+```
 
 ## 進捗表示機能
 

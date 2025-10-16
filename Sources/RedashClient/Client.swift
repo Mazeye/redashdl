@@ -183,15 +183,34 @@ public final class Client {
         maxAge: Int = 0,
         limit: Int = 10000,
         maxIter: Int = 100,
-        showProgress: Bool = true
+        showProgress: Bool = true,
+        concurrency: Int = 1
+    ) throws -> DataFrame {
+        if limit <= 0 {
+            return try self.query(queryId: queryId, params: baseParams, maxAge: maxAge)
+        }
+        
+        // 如果并发数为1，使用原来的顺序执行
+        if concurrency <= 1 {
+            return try safeQuerySequential(queryId: queryId, baseParams: baseParams, maxAge: maxAge, limit: limit, maxIter: maxIter, showProgress: showProgress)
+        }
+        
+        // 并发执行
+        return try safeQueryConcurrent(queryId: queryId, baseParams: baseParams, maxAge: maxAge, limit: limit, maxIter: maxIter, showProgress: showProgress, concurrency: concurrency)
+    }
+    
+    // MARK: - Safe Query Helper Methods
+    private func safeQuerySequential(
+        queryId: Int,
+        baseParams: [String: String],
+        maxAge: Int,
+        limit: Int,
+        maxIter: Int,
+        showProgress: Bool
     ) throws -> DataFrame {
         var headers: [String] = []
         var allRows: [[String]] = []
         var totalRows = 0
-        
-        if limit <= 0 {
-            return try self.query(queryId: queryId, params: baseParams, maxAge: maxAge)
-        }
         
         let progress = showProgress ? ProgressReporter(totalSteps: maxIter) : nil
         
@@ -220,6 +239,76 @@ public final class Client {
         
         return DataFrame(headers: headers, rows: allRows)
     }
+    
+    private func safeQueryConcurrent(
+        queryId: Int,
+        baseParams: [String: String],
+        maxAge: Int,
+        limit: Int,
+        maxIter: Int,
+        showProgress: Bool,
+        concurrency: Int
+    ) throws -> DataFrame {
+        var headers: [String] = []
+        var allRows: [[String]] = []
+        var totalRows = 0
+        
+        let progress = showProgress ? ProgressReporter(totalSteps: maxIter) : nil
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "redash.safe.concurrent", attributes: .concurrent)
+        let semaphore = DispatchSemaphore(value: concurrency)
+        let lock = NSLock()
+        var hasError: Error?
+        
+        for batchIndex in 0..<maxIter {
+            group.enter()
+            semaphore.wait()
+            
+            queue.async {
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+                
+                do {
+                    let startIndex = batchIndex * limit
+                    var params = baseParams
+                    params["offset_rows"] = String(startIndex)
+                    params["limit_rows"] = String(limit)
+                    
+                    let df = try self.query(queryId: queryId, params: params, maxAge: maxAge)
+                    
+                    lock.lock()
+                    defer { lock.unlock() }
+                    
+                    if df.rows.isEmpty { return }
+                    if headers.isEmpty { headers = df.headers }
+                    allRows.append(contentsOf: df.rows)
+                    totalRows += df.rows.count
+                    
+                    if showProgress {
+                        progress?.update(step: batchIndex + 1, message: "第\(batchIndex + 1)ページ取得中 (\(totalRows)行取得済み)")
+                    }
+                } catch {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    hasError = error
+                }
+            }
+        }
+        
+        group.wait()
+        
+        if let error = hasError {
+            throw error
+        }
+        
+        if showProgress {
+            progress?.complete(message: "Safeクエリ完了、\(totalRows)行のデータを取得")
+        }
+        
+        return DataFrame(headers: headers, rows: allRows)
+    }
 
     // MARK: - Period limited query
     public func periodLimitedQuery(
@@ -230,7 +319,63 @@ public final class Client {
         intervalMultiple: Int = 1,
         baseParams: [String: String] = [:],
         maxAge: Int = 0,
-        showProgress: Bool = true
+        showProgress: Bool = true,
+        concurrency: Int = 1
+    ) throws -> DataFrame {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let start = formatter.date(from: startDate), let end = formatter.date(from: endDate) else {
+            throw RedashError.apiMessage("Invalid date format. Use yyyy-MM-dd")
+        }
+        let cal = Calendar(identifier: .gregorian)
+        func add(_ d: Date) -> Date? {
+            switch interval.lowercased() {
+            case "day", "d":
+                return cal.date(byAdding: .day, value: intervalMultiple, to: d)
+            case "week", "w":
+                return cal.date(byAdding: .weekOfYear, value: intervalMultiple, to: d)
+            case "month", "m":
+                return cal.date(byAdding: .month, value: intervalMultiple, to: d)
+            case "quarter", "q":
+                return cal.date(byAdding: .month, value: 3 * intervalMultiple, to: d)
+            case "year", "y":
+                return cal.date(byAdding: .year, value: intervalMultiple, to: d)
+            default:
+                return nil
+            }
+        }
+        
+        // 计算总的时间段数量
+        var tempCurrent = start
+        var totalPeriods = 0
+        while tempCurrent <= end {
+            guard let next = add(tempCurrent) else { break }
+            totalPeriods += 1
+            if next <= tempCurrent { break }
+            tempCurrent = next
+        }
+        
+        // 如果并发数为1，使用原来的顺序执行
+        if concurrency <= 1 {
+            return try periodLimitedQuerySequential(queryId: queryId, startDate: startDate, endDate: endDate, interval: interval, intervalMultiple: intervalMultiple, baseParams: baseParams, maxAge: maxAge, showProgress: showProgress)
+        }
+        
+        // 并发执行
+        return try periodLimitedQueryConcurrent(queryId: queryId, startDate: startDate, endDate: endDate, interval: interval, intervalMultiple: intervalMultiple, baseParams: baseParams, maxAge: maxAge, showProgress: showProgress, concurrency: concurrency)
+    }
+    
+    // MARK: - Period Query Helper Methods
+    private func periodLimitedQuerySequential(
+        queryId: Int,
+        startDate: String,
+        endDate: String,
+        interval: String,
+        intervalMultiple: Int,
+        baseParams: [String: String],
+        maxAge: Int,
+        showProgress: Bool
     ) throws -> DataFrame {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
@@ -306,6 +451,119 @@ public final class Client {
             
             // 额外的安全检查：防止无限循环
             if periodIndex > 10000 { break }
+        }
+        
+        if showProgress {
+            progress?.complete(message: "Periodクエリ完了、\(totalRows)行のデータを取得")
+        }
+        
+        return DataFrame(headers: headers, rows: allRows)
+    }
+    
+    private func periodLimitedQueryConcurrent(
+        queryId: Int,
+        startDate: String,
+        endDate: String,
+        interval: String,
+        intervalMultiple: Int,
+        baseParams: [String: String],
+        maxAge: Int,
+        showProgress: Bool,
+        concurrency: Int
+    ) throws -> DataFrame {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let start = formatter.date(from: startDate), let end = formatter.date(from: endDate) else {
+            throw RedashError.apiMessage("Invalid date format. Use yyyy-MM-dd")
+        }
+        let cal = Calendar(identifier: .gregorian)
+        func add(_ d: Date) -> Date? {
+            switch interval.lowercased() {
+            case "day", "d":
+                return cal.date(byAdding: .day, value: intervalMultiple, to: d)
+            case "week", "w":
+                return cal.date(byAdding: .weekOfYear, value: intervalMultiple, to: d)
+            case "month", "m":
+                return cal.date(byAdding: .month, value: intervalMultiple, to: d)
+            case "quarter", "q":
+                return cal.date(byAdding: .month, value: 3 * intervalMultiple, to: d)
+            case "year", "y":
+                return cal.date(byAdding: .year, value: intervalMultiple, to: d)
+            default:
+                return nil
+            }
+        }
+        
+        // 收集所有时间段
+        var periods: [(Date, Date)] = []
+        var current = start
+        while current <= end {
+            guard let next = add(current) else { break }
+            let nextMinusOne = cal.date(byAdding: .day, value: -1, to: next) ?? next
+            let segmentEnd = min(nextMinusOne, end)
+            periods.append((current, segmentEnd))
+            
+            if next <= current { break }
+            current = next
+        }
+        
+        let totalPeriods = max(periods.count, 1)
+        let progress = showProgress ? ProgressReporter(totalSteps: totalPeriods) : nil
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "redash.period.concurrent", attributes: .concurrent)
+        let semaphore = DispatchSemaphore(value: concurrency)
+        let lock = NSLock()
+        var headers: [String] = []
+        var allRows: [[String]] = []
+        var totalRows = 0
+        var hasError: Error?
+        
+        for (index, (startDate, endDate)) in periods.enumerated() {
+            group.enter()
+            semaphore.wait()
+            
+            queue.async {
+                defer {
+                    semaphore.signal()
+                    group.leave()
+                }
+                
+                do {
+                    var params = baseParams
+                    params["start_date"] = formatter.string(from: startDate)
+                    params["end_date"] = formatter.string(from: endDate)
+                    
+                    let df = try self.query(queryId: queryId, params: params, maxAge: maxAge)
+                    
+                    lock.lock()
+                    defer { lock.unlock() }
+                    
+                    if headers.isEmpty { headers = df.headers }
+                    if !df.rows.isEmpty { 
+                        allRows.append(contentsOf: df.rows)
+                        totalRows += df.rows.count
+                    }
+                    
+                    if showProgress {
+                        let startStr = formatter.string(from: startDate)
+                        let endStr = formatter.string(from: endDate)
+                        progress?.update(step: index + 1, 
+                                       message: "期間処理中: \(startStr) から \(endStr) (\(totalRows)行取得済み)")
+                    }
+                } catch {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    hasError = error
+                }
+            }
+        }
+        
+        group.wait()
+        
+        if let error = hasError {
+            throw error
         }
         
         if showProgress {
